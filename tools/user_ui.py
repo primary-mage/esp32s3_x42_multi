@@ -30,7 +30,7 @@ from tkinter import messagebox, scrolledtext, ttk
 from x42link import (DEFAULT_ACCEL, DEFAULT_LEAD_MM, DEFAULT_PULSES_REV,
                      DEFAULT_SPEED_MM_S, DEFAULT_TRAVEL_X, DEFAULT_TRAVEL_Y,
                      LinkError, Machine, X42Link)
-from curve_editor import CurveEditor, build_segments
+from curve_editor import CurveEditor, build_segments, interp_track
 
 TRAJ_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trajectories")
 
@@ -39,36 +39,87 @@ TRAJ_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trajectorie
 
 class Trajectory:
     """tracks = {"X": [[t_s, pos_mm], ...], "Y": [[t_s, pos_mm], ...]}
-    相邻关键帧直线插值；段速度 = Δ位置/Δ时间，超限标红。"""
+    相邻关键帧直线插值；段速度 = Δ位置/Δ时间，超限标红。
+    stirs = [{"t0", "t1", "freq_hz", "amp_mm"}, ...]：Y 轴搅拌段（支线任务），
+    窗口内 Y 曲线必须平坦（Y 被振动占用），X 照常运动。"""
 
-    def __init__(self, name="未命名", speed_limit_mm_s=40.0, duration_s=30.0, tracks=None):
+    def __init__(self, name="未命名", speed_limit_mm_s=40.0, duration_s=30.0,
+                 tracks=None, stirs=None):
         self.name = name
         self.speed_limit_mm_s = speed_limit_mm_s
         self.duration_s = duration_s
         self.tracks = tracks or {"X": [[0.0, 0.0], [duration_s, 0.0]],
                                  "Y": [[0.0, 0.0], [duration_s, 0.0]]}
+        self.stirs = stirs or []
 
     def to_dict(self):
         return {"name": self.name, "speed_limit_mm_s": self.speed_limit_mm_s,
                 "duration_s": self.duration_s,
                 "tracks": {"X": [list(p) for p in self.tracks["X"]],
-                           "Y": [list(p) for p in self.tracks["Y"]]}}
+                           "Y": [list(p) for p in self.tracks["Y"]]},
+                "stirs": [dict(s) for s in self.stirs]}
 
     @classmethod
     def from_dict(cls, d):
+        stirs = [{"t0": float(s["t0"]), "t1": float(s["t1"]),
+                  "freq_hz": float(s["freq_hz"]), "amp_mm": float(s["amp_mm"])}
+                 for s in d.get("stirs", [])]
         if "tracks" in d:
             tracks = {ax: [[float(t), float(p)] for t, p in d["tracks"].get(ax, [])]
                       for ax in ("X", "Y")}
             return cls(d.get("name", "未命名"),
                        float(d.get("speed_limit_mm_s", 40.0)),
-                       float(d.get("duration_s", 30.0)), tracks)
+                       float(d.get("duration_s", 30.0)), tracks, stirs)
         # 兼容旧版步骤表格式：每步一个关键帧，5 秒/步，直线过渡
         steps = [(str(s["axis"]).upper(), float(s["pos"])) for s in d.get("steps", [])]
         dur = max(5.0 * len(steps), 10.0)
         tracks = {"X": [[0.0, 0.0], [dur, 0.0]], "Y": [[0.0, 0.0], [dur, 0.0]]}
         for i, (ax, p) in enumerate(steps, start=1):
             tracks[ax].append([i * 5.0, p])
-        return cls(d.get("name", "未命名"), 40.0, dur, tracks)
+        return cls(d.get("name", "未命名"), 40.0, dur, tracks, stirs)
+
+
+def validate_stirs(traj: Trajectory, y_top: float, extra: dict | None = None) -> list:
+    """严格校验搅拌段，返回错误列表（空 = 合法）：
+    - 时间范围 0≤t0<t1≤总时长；频率 0.1~10Hz；振幅>0
+    - 振动期间 Y 曲线必须平坦（Y 被振动占用）
+    - 中心±振幅始终在行程内（0~y_top）
+    - 搅拌段互不重叠"""
+    errs: list = []
+    stirs = [dict(s) for s in traj.stirs]
+    if extra:
+        stirs.append(dict(extra))
+    dur = traj.duration_s
+    ytrack = traj.tracks.get("Y", [])
+    for i, s in enumerate(stirs):
+        t0, t1, f, a = s["t0"], s["t1"], s["freq_hz"], s["amp_mm"]
+        if not (0.0 <= t0 < t1 <= dur + 1e-6):
+            errs.append(f"搅拌段{i + 1}: 时间 {t0:g}~{t1:g}s 非法（需 0≤开始<结束≤总时长 {dur:g}s）")
+            continue
+        if not (0.1 <= f <= 10.0):
+            errs.append(f"搅拌段{i + 1}: 频率 {f:g}Hz 超出 0.1~10Hz")
+        if a <= 0:
+            errs.append(f"搅拌段{i + 1}: 振幅必须 > 0")
+            continue
+        # 振动期间 Y 曲线必须平坦
+        yc = interp_track(ytrack, t0)
+        if abs(interp_track(ytrack, t1) - yc) > 0.05:
+            errs.append(f"搅拌段{i + 1}: Y 曲线在 {t0:g}~{t1:g}s 内不平坦（振动期间 Y 不能位移）")
+            continue
+        for t, _ in ytrack:
+            if t0 - 1e-6 < t < t1 + 1e-6 and abs(interp_track(ytrack, t) - yc) > 0.05:
+                errs.append(f"搅拌段{i + 1}: Y 曲线在 {t0:g}~{t1:g}s 内不平坦（振动期间 Y 不能位移）")
+                break
+        # 限位：中心±振幅始终在行程内
+        if not (a - 1e-6 <= yc <= y_top - a + 1e-6):
+            errs.append(f"搅拌段{i + 1}: Y={yc:.1f}mm 振动 ±{a:g}mm 越界（行程 0~{y_top:g}mm）")
+    srt = sorted(stirs, key=lambda s: s["t0"])
+    for i in range(len(srt) - 1):
+        if srt[i]["t1"] > srt[i + 1]["t0"] + 1e-6:
+            errs.append(f"搅拌段重叠: {srt[i]['t0']:g}~{srt[i]['t1']:g} 与 "
+                        f"{srt[i + 1]['t0']:g}~{srt[i + 1]['t1']:g}")
+            break
+    return errs
 
 
 def list_trajectories() -> list[str]:
@@ -156,12 +207,6 @@ class App(tk.Tk):
             self.editor.set_selected_pos(pos)
             self._on_curve_changed()
             self.log(f"关键帧已更新为当前 {axis} 位置 {pos:.1f}mm")
-        elif kind == "vib_state":
-            st, af = args
-            text = self.VIB_TEXT.get(st, "?")
-            if af > 0:
-                text += f" {af:.1f}Hz"
-            self.vib_state_var.set(text)
         elif kind == "error":
             messagebox.showerror(args[0], args[1])
 
@@ -240,7 +285,7 @@ class App(tk.Tk):
             self.editor.set_tracks(self.traj.tracks, self.traj.duration_s)
             self.editor.limit = self.traj.speed_limit_mm_s
             self.editor.redraw()
-            self._refresh_run_preview()
+            self._refresh_stirs()
 
     def _enter_run(self):
         if not self.selected_traj_name.get():
@@ -285,6 +330,7 @@ class App(tk.Tk):
 
     def _refresh_run_preview(self):
         self.preview.set_tracks(self.traj.tracks, self.traj.duration_s)
+        self.preview.set_stirs(self.traj.stirs)
         self.preview.limit = self.traj.speed_limit_mm_s
         self.preview.redraw()
 
@@ -329,24 +375,24 @@ class App(tk.Tk):
         ttk.Button(jog, text="用当前实际位置更新选中关键帧",
                    command=self.on_update_selected).pack(side="right", padx=6)
 
-        vib = ttk.LabelFrame(frm, text="振荡搅拌（定时驱动，固件本地循环）")
+        vib = ttk.LabelFrame(frm, text="搅拌段（Y 轴支线任务：该时间段内 Y 轴振动，X 照常运动）")
         vib.pack(fill="x", pady=(6, 2))
-        self.vib_axis_var = tk.StringVar(value="Y")
-        self.vib_f_var = tk.StringVar(value="2")
-        self.vib_a_var = tk.StringVar(value="5")
-        self.vib_dur_var = tk.StringVar(value="10")
-        self.vib_state_var = tk.StringVar(value="空闲")
-        ttk.Combobox(vib, textvariable=self.vib_axis_var, values=("X", "Y"),
-                     width=4, state="readonly").pack(side="left", padx=4, pady=6)
-        ttk.Label(vib, text="频率Hz").pack(side="left")
-        ttk.Entry(vib, textvariable=self.vib_f_var, width=5).pack(side="left", padx=2)
-        ttk.Label(vib, text="振幅±mm").pack(side="left", padx=(8, 2))
-        ttk.Entry(vib, textvariable=self.vib_a_var, width=5).pack(side="left", padx=2)
-        ttk.Label(vib, text="时长s(0=手动停)").pack(side="left", padx=(8, 2))
-        ttk.Entry(vib, textvariable=self.vib_dur_var, width=5).pack(side="left", padx=2)
-        ttk.Button(vib, text="开始", command=self.on_vib_start).pack(side="left", padx=6)
-        ttk.Button(vib, text="停止", command=self.on_vib_stop).pack(side="left", padx=4)
-        ttk.Label(vib, textvariable=self.vib_state_var, foreground="#666").pack(side="left", padx=8)
+        self.stir_t0_var = tk.StringVar(value="5")
+        self.stir_t1_var = tk.StringVar(value="15")
+        self.stir_f_var = tk.StringVar(value="2")
+        self.stir_a_var = tk.StringVar(value="5")
+        ttk.Label(vib, text="开始s").pack(side="left", padx=(6, 2))
+        ttk.Entry(vib, textvariable=self.stir_t0_var, width=5).pack(side="left")
+        ttk.Label(vib, text="结束s").pack(side="left", padx=(6, 2))
+        ttk.Entry(vib, textvariable=self.stir_t1_var, width=5).pack(side="left")
+        ttk.Label(vib, text="频率Hz").pack(side="left", padx=(6, 2))
+        ttk.Entry(vib, textvariable=self.stir_f_var, width=5).pack(side="left")
+        ttk.Label(vib, text="振幅±mm").pack(side="left", padx=(6, 2))
+        ttk.Entry(vib, textvariable=self.stir_a_var, width=5).pack(side="left")
+        ttk.Button(vib, text="添加搅拌段", command=self.on_stir_add).pack(side="left", padx=8)
+        ttk.Button(vib, text="删除选中", command=self.on_stir_del).pack(side="left", padx=4)
+        self.stir_list = tk.Listbox(vib, height=3, width=36)
+        self.stir_list.pack(side="left", padx=8, pady=4)
 
         save = ttk.Frame(frm)
         save.pack(fill="x", pady=4)
@@ -384,6 +430,7 @@ class App(tk.Tk):
         self.editor.set_tracks(self.traj.tracks, self.traj.duration_s)
         self.editor.limit = self.traj.speed_limit_mm_s
         self.editor.redraw()
+        self._refresh_stirs()
         self._refresh_run_preview()
         self.log("已新建空轨迹")
 
@@ -391,8 +438,10 @@ class App(tk.Tk):
         """清空当前轨迹内容（保留时长/限速/名称），Y 线落到最上方"""
         dur = self.traj.duration_s
         self.traj.tracks = self._empty_tracks(dur)
+        self.traj.stirs = []
         self.editor.set_tracks(self.traj.tracks, dur)
         self.editor.redraw()
+        self._refresh_stirs()
         self._refresh_run_preview()
         self.log("轨迹已清空")
 
@@ -413,6 +462,7 @@ class App(tk.Tk):
         self.editor.set_tracks(self.traj.tracks, new_dur)
         self.editor.limit = new_limit
         self.editor.redraw()
+        self._refresh_stirs()
         self._refresh_run_preview()
 
     def on_update_selected(self):
@@ -434,71 +484,46 @@ class App(tk.Tk):
         self._ui("update_sel", axis,
                  x if axis == "X" else self._y_disp(y))
 
-    # ================= 振荡搅拌 =================
-    VIB_TEXT = {0: "空闲", 1: "振荡中", 2: "完成", 3: "失败(堵转)", 4: "已停止"}
+    # ================= 搅拌段（Y 轴支线任务） =================
 
-    def on_vib_start(self):
-        if not self._need_machine():
-            return
-        if not self.machine.homed:
-            messagebox.showwarning("未复位", "请先在首页执行复位")
-            return
+    def _refresh_stirs(self):
+        """搅拌段列表 + 编辑器/预览搅拌带同步"""
+        self.stir_list.delete(0, "end")
+        for s in sorted(self.traj.stirs, key=lambda s: s["t0"]):
+            self.stir_list.insert("end",
+                                  f"{s['t0']:.1f}~{s['t1']:.1f}s  "
+                                  f"{s['freq_hz']:g}Hz ±{s['amp_mm']:g}mm")
+        self.editor.set_stirs(self.traj.stirs)
+        self._refresh_run_preview()
+
+    def on_stir_add(self):
         try:
-            f = float(self.vib_f_var.get())
-            a = float(self.vib_a_var.get())
-            dur = int(float(self.vib_dur_var.get()))
+            t0 = float(self.stir_t0_var.get())
+            t1 = float(self.stir_t1_var.get())
+            f = float(self.stir_f_var.get())
+            a = float(self.stir_a_var.get())
         except ValueError:
-            messagebox.showerror("参数错误", "频率/振幅/时长必须是数字")
+            messagebox.showerror("参数错误", "时间/频率/振幅必须是数字")
             return
-        if f <= 0 or a <= 0 or dur < 0:
-            messagebox.showerror("参数错误", "频率/振幅需大于 0")
+        errs = validate_stirs(self.traj, self._y_top(),
+                              extra={"t0": t0, "t1": t1, "freq_hz": f, "amp_mm": a})
+        if errs:
+            messagebox.showerror("搅拌段无效", "\n".join(errs))
             return
-        axis = self.vib_axis_var.get()
-        threading.Thread(target=self._vib_worker,
-                         args=(axis, f, a, dur), daemon=True).start()
+        self.traj.stirs.append({"t0": t0, "t1": t1, "freq_hz": f, "amp_mm": a})
+        self._refresh_stirs()
+        self.log(f"已添加搅拌段: {t0:g}~{t1:g}s {f:g}Hz ±{a:g}mm")
 
-    def on_vib_stop(self):
-        if not self._need_machine():
+    def on_stir_del(self):
+        sel = self.stir_list.curselection()
+        if not sel:
+            messagebox.showwarning("未选择", "请先在列表中选中搅拌段")
             return
-        threading.Thread(target=self._vib_stop_worker, daemon=True).start()
-
-    def _vib_stop_worker(self):
-        with self.ops_lock:
-            try:
-                self.machine.vib_stop()
-                self._ui("log", "已请求停止振荡")
-            except LinkError as e:
-                self._ui("log", f"停止失败: {e}")
-
-    def _vib_worker(self, axis, f, a, dur):
-        with self.ops_lock:
-            self._ui("busy", "振荡中...")
-            try:
-                self.machine.check_vib_bounds(axis, a)
-                self.machine.vib_start(axis, f, a, dur,
-                                       mirror=(self.y3inv_var.get() and axis == "Y"))
-                self._ui("log", f"振荡开始: {axis}轴 ±{a}mm {f}Hz {dur}s")
-                t0 = time.time()
-                while True:
-                    time.sleep(0.5)
-                    st, cyc, ms = self.machine.vib_state()
-                    af = (cyc / 2.0) / (ms / 1000.0) if ms > 0 else 0.0
-                    self._ui("vib_state", st, af)
-                    if st in (2, 3, 4):
-                        break
-                    if dur and time.time() - t0 > dur + 30:
-                        raise LinkError("振荡超时未结束")
-                if st == 2:
-                    self._ui("log", f"振荡完成（实际 {af:.1f}Hz）")
-                elif st == 3:
-                    self._ui("log", "振荡失败：堵转保护触发")
-                elif st == 4:
-                    self._ui("log", f"振荡已停止（实际 {af:.1f}Hz）")
-            except LinkError as e:
-                self._ui("log", f"振荡失败: {e}")
-                self._ui("vib_state", 0, 0.0)
-            finally:
-                self._ui("busy", "空闲")
+        srt = sorted(self.traj.stirs, key=lambda s: s["t0"])
+        del srt[sel[0]]
+        self.traj.stirs = srt
+        self._refresh_stirs()
+        self.log("已删除搅拌段")
 
     def _build_advanced(self, parent):
         self.adv_visible = tk.BooleanVar(value=False)
@@ -699,6 +724,10 @@ class App(tk.Tk):
         if any(len(self.traj.tracks[ax]) < 2 for ax in ("X", "Y")):
             messagebox.showwarning("空轨迹", "轨迹没有内容")
             return
+        errs = validate_stirs(self.traj, self._y_top())
+        if errs:
+            messagebox.showerror("搅拌段校验失败", "\n".join(errs))
+            return
         if self.exec_thread and self.exec_thread.is_alive():
             return
         self.stop_event.clear()
@@ -710,7 +739,10 @@ class App(tk.Tk):
     def _run_worker(self):
         with self.ops_lock:
             self._ui("busy", "执行轨迹")
-            segs = build_segments(self.traj.tracks, self.traj.duration_s)
+            stirs = sorted(self.traj.stirs, key=lambda s: s["t0"])
+            stir_times = [t for s in stirs for t in (s["t0"], s["t1"])]
+            segs = build_segments(self.traj.tracks, self.traj.duration_s,
+                                  extra_times=tuple(stir_times))
             try:
                 for i, (t0, t1, x0, y0, x1, y1) in enumerate(segs):
                     if self.stop_event.is_set():
@@ -721,6 +753,12 @@ class App(tk.Tk):
                     if self.stop_event.is_set():
                         self._ui("log", "轨迹已停止")
                         return
+                    # 搅拌窗口内：Y 被振动占用（曲线已校验平坦），X 照常运动
+                    stir = next((s for s in stirs
+                                 if s["t0"] - 1e-6 <= t0 < s["t1"] - 1e-6), None)
+                    if stir:
+                        self._run_stir_slice(stir, t0, t1, x0, x1)
+                        continue
                     dx, dy = x1 - x0, y1 - y0
                     # 兜底：钳位到行程内（防止手工改 JSON / 旧数据越界）
                     x1c = min(max(x1, 0.0), self.machine.travel_x[1])
@@ -762,6 +800,38 @@ class App(tk.Tk):
                 self._ui("run_btns", "normal", "disabled")
                 self._ui("clear_progress")
 
+    def _run_stir_slice(self, stir, t0, t1, x0, x1):
+        """搅拌窗口内的一个时间片：起点启动振动；X 照常运动；终点等振动结束"""
+        start = abs(t0 - stir["t0"]) < 1e-6
+        end = abs(t1 - stir["t1"]) < 1e-6
+        if start:
+            dur_s = max(1, int(round(stir["t1"] - stir["t0"])))
+            self._ui("highlight", stir["t0"], stir["t1"])
+            self._ui("log", f"→ 搅拌 {stir['t0']:.1f}~{stir['t1']:.1f}s: "
+                            f"{stir['freq_hz']:g}Hz ±{stir['amp_mm']:g}mm")
+            self.machine.vib_start("Y", stir["freq_hz"], stir["amp_mm"], dur_s,
+                                   mirror=self.y3inv_var.get())
+        # 窗口内 X 照常运动（Y 曲线平坦，无 Y 位移）
+        if abs(x1 - x0) >= 0.02:
+            spd = min(abs(x1 - x0) / max(t1 - t0, 0.05),
+                      self.traj.speed_limit_mm_s)
+            self.machine.move_axis("X", x1, spd,
+                                   stop_check=self.stop_event.is_set)
+        if end:
+            # 等固件振动自然结束（定时驱动，偶数半周期后回中心）
+            st = 1
+            while not self.stop_event.is_set():
+                st, cyc, ms = self.machine.vib_state()
+                if st in (2, 3, 4):
+                    break
+                time.sleep(0.3)
+            if self.stop_event.is_set():
+                raise LinkError("已停止")
+            af = (cyc / 2.0) / (ms / 1000.0) if ms > 0 else 0.0
+            if st == 3:
+                raise LinkError("搅拌失败：堵转保护触发")
+            self._ui("log", f"  搅拌段完成（实际 {af:.1f}Hz）")
+
     def on_pause(self):
         self.pause_event.set()
         if self.machine:
@@ -800,7 +870,7 @@ class App(tk.Tk):
         self.editor.set_tracks(self.traj.tracks, self.traj.duration_s)
         self.editor.limit = self.traj.speed_limit_mm_s
         self.editor.redraw()
-        self._refresh_run_preview()
+        self._refresh_stirs()
         self.log(f"轨迹已加载: {path}")
 
     # ================= 高级设置 =================

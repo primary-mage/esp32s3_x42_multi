@@ -50,10 +50,13 @@ def normalize_tracks(tracks: dict) -> dict:
     return out
 
 
-def build_segments(tracks: dict, duration_s: float) -> list:
-    """合并两轴关键帧时间点 -> 段列表 [(t0, t1, x0, y0, x1, y1), ...]"""
+def build_segments(tracks: dict, duration_s: float, extra_times: tuple = ()) -> list:
+    """合并两轴关键帧时间点 -> 段列表 [(t0, t1, x0, y0, x1, y1), ...]
+    extra_times: 额外切分点（如搅拌段起止时间），保证搅拌窗口与段边界对齐"""
     tracks = normalize_tracks(tracks)
     times = {0.0, duration_s}
+    for t in extra_times:
+        times.add(float(t))
     for ax in ("X", "Y"):
         for t, _ in tracks.get(ax, []):
             times.add(t)
@@ -91,6 +94,7 @@ class CurveEditor(tk.Canvas):
         self.drag_offset = None         # (dt, dpos)
         self.highlight = None           # (t0, t1)
         self.playhead = None            # t
+        self.stirs = []                 # [{"t0","t1","freq_hz","amp_mm"}, ...]
         if not readonly:
             self.bind("<Button-1>", self._on_press)
             self.bind("<B1-Motion>", self._on_drag)
@@ -147,6 +151,7 @@ class CurveEditor(tk.Canvas):
         if self.playhead is not None:
             x = self._t2x(self.playhead)
             self.create_line(x, 8, x, self.height - 4, fill="#ff5555", width=2)
+        self._draw_stirs()
         for ax in self.AXES:
             self._draw_curve(ax)
             self._draw_points(ax)
@@ -198,6 +203,20 @@ class CurveEditor(tk.Canvas):
         b = self._t2x(t1)
         self.create_rectangle(a, 6, b, self.height - 6, fill="#ffffff",
                               stipple="gray25", outline="")
+
+    def _draw_stirs(self):
+        """搅拌段：Y 轨道上的橙色斜纹带 + 标签"""
+        for s in self.stirs:
+            a = self._t2x(max(s["t0"], 0.0))
+            b = self._t2x(min(s["t1"], self.duration_s))
+            _, y0, _, y1 = self._lane_rect("Y")
+            if b <= a:
+                continue
+            self.create_rectangle(a, y0, b, y1, fill="#ffb347",
+                                  stipple="gray25", outline="#ff8800", width=2)
+            self.create_text((a + b) / 2, y0 + 12,
+                             text=f"搅拌 {s['freq_hz']:g}Hz ±{s['amp_mm']:g}mm",
+                             fill="#ffd28a", font=("", 9))
 
     # ---------- 交互 ----------
     def _on_press(self, ev):
@@ -304,6 +323,10 @@ class CurveEditor(tk.Canvas):
 
     def set_highlight(self, t0, t1):
         self.highlight = (t0, t1)
+        self.redraw()
+
+    def set_stirs(self, stirs):
+        self.stirs = stirs
         self.redraw()
 
     def set_playhead(self, t):
