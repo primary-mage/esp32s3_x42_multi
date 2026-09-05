@@ -1,0 +1,9 @@
+# ESP-IDF 构建产物
+build/
+
+# Python
+__pycache__/
+*.pyc
+
+# 运行期用户数据（轨迹 JSON，不入库）
+tools/trajectories/*.json
