@@ -11,12 +11,15 @@
 """
 from __future__ import annotations
 
+import argparse
 import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
 import serial
+
+from port_utils import default_controller_port
 
 
 # ================= 串口链路 =================
@@ -288,13 +291,13 @@ class SyncFrame(ttk.LabelFrame):
 
 
 class X42App(tk.Tk):
-    def __init__(self):
+    def __init__(self, port: str | None = None):
         super().__init__()
         self.title("张大头 X42S 三电机上位机")
         self.link: Link | None = None
         self._poll_alive = threading.Event()
 
-        self.port_var = tk.StringVar(value="/dev/ttyACM0")
+        self.port_var = tk.StringVar(value=port or default_controller_port())
         self.lead_mm = tk.DoubleVar(value=4.0)       # 丝杆导程 mm/圈
         self.pulses_rev = tk.IntVar(value=3200)      # 每圈脉冲（16细分）
         self.conn_var = tk.StringVar(value="未连接")
@@ -314,6 +317,7 @@ class X42App(tk.Tk):
         top.pack(fill="x", padx=6, pady=4)
         ttk.Label(top, text="串口").pack(side="left")
         ttk.Entry(top, textvariable=self.port_var, width=14).pack(side="left", padx=4)
+        ttk.Button(top, text="刷新", command=self.on_refresh_port).pack(side="left", padx=2)
         ttk.Label(top, text="导程(mm/圈)").pack(side="left")
         ttk.Entry(top, textvariable=self.lead_mm, width=6).pack(side="left", padx=4)
         ttk.Label(top, text="每圈脉冲").pack(side="left")
@@ -326,6 +330,11 @@ class X42App(tk.Tk):
     def _build_bottom(self) -> None:
         self.logbox = scrolledtext.ScrolledText(self, height=10, state="disabled")
         self.logbox.pack(fill="both", expand=True, padx=6, pady=4)
+
+    def on_refresh_port(self) -> None:
+        port = default_controller_port()
+        if port:
+            self.port_var.set(port)
 
     def _build_home(self) -> None:
         """回零参数全局配置（写入所有电机）"""
@@ -459,4 +468,6 @@ class X42App(tk.Tk):
 
 
 if __name__ == "__main__":
-    X42App().mainloop()
+    parser = argparse.ArgumentParser(description="X42 debug interface")
+    parser.add_argument("--port", help="controller serial port, for example COM4 or /dev/ttyACM0")
+    X42App(parser.parse_args().port).mainloop()

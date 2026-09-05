@@ -15,6 +15,22 @@ typedef enum {
     VIB_STOPPED,      /**< 已停止（VIBSTP 优雅停 / STP 0 急停） */
 } vib_state_t;
 
+typedef enum {
+    VIB_FAULT_NONE = 0,
+    VIB_FAULT_M1_FD,
+    VIB_FAULT_M2_FD,
+    VIB_FAULT_M3_FD,
+    VIB_FAULT_GO,
+    VIB_FAULT_CLOG_M1,
+    VIB_FAULT_CLOG_M2,
+    VIB_FAULT_CLOG_M3,
+    VIB_FAULT_CENTER_M1_FD,
+    VIB_FAULT_CENTER_M2_FD,
+    VIB_FAULT_CENTER_M3_FD,
+    VIB_FAULT_CENTER_GO,
+    VIB_FAULT_CENTER_INPOS,
+} vib_fault_phase_t;
+
 /** 初始化（m1/m2/m3 对应 ID=1/2/3 的句柄） */
 void vib_init(zdt_x42_t *m1, zdt_x42_t *m2, zdt_x42_t *m3);
 
@@ -40,3 +56,6 @@ vib_state_t vib_state(void);
 
 /** 已执行半周期数与运行时长 ms（PC 据此计算实际频率） */
 void vib_stats(uint32_t *cycles, uint32_t *elapsed_ms);
+
+void vib_fault_info(vib_fault_phase_t *phase, int *error_code);
+const char *vib_fault_phase_name(vib_fault_phase_t phase);

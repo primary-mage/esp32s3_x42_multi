@@ -312,8 +312,13 @@ static void handle_line(char *line)
         cmd_ok("VIBSTP");
     } else if (strcmp(tok[0], "VSTATE") == 0) {
         uint32_t c = 0, ms = 0;
+        vib_fault_phase_t phase = VIB_FAULT_NONE;
+        int fault_code = 0;
         vib_stats(&c, &ms);
-        printf("CMD> VSTATE %d %lu %lu\n", (int)vib_state(), (unsigned long)c, (unsigned long)ms);
+        vib_fault_info(&phase, &fault_code);
+        printf("CMD> VSTATE %d %lu %lu %s %d\n", (int)vib_state(),
+               (unsigned long)c, (unsigned long)ms,
+               vib_fault_phase_name(phase), fault_code);
     } else if (strcmp(tok[0], "STAT") == 0 && n >= 2) {
         cmd_stat(atoi(tok[1]));
     } else {

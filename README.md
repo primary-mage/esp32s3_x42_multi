@@ -27,7 +27,7 @@ ESP32-S3 一条 UART 挂多台张大头闭环步进电机。**x42s_v2.0 出厂�
 source ../activate-esp-idf.sh
 idf.py set-target esp32s3
 idf.py build
-idf.py -p /dev/ttyACM0 flash monitor
+idf.py -p <PORT> flash monitor
 ```
 
 日志走 USB Serial/JTAG；UART1 专用于电机总线。
@@ -52,8 +52,27 @@ tools/
 ## 用户 UI（面向操作人员）
 
 ```bash
-python3 tools/user_ui.py
+python -m pip install -r requirements.txt
+python tools/user_ui.py
 ```
+
+PC tools require Python 3.10 or newer, `pyserial`, and Tkinter. Tkinter is
+included with the standard Python installers for Windows and macOS; on many
+Linux distributions it is supplied by a separate system package such as
+`python3-tk`.
+
+The GUI automatically selects an Espressif USB-JTAG serial port when it can
+identify one. Use the port field and its `刷新` button to change it, or provide
+an explicit port when starting the UI:
+
+```bash
+python tools/user_ui.py --port COM4
+python tools/user_ui.py --port /dev/ttyACM0
+python tools/x42_ui.py --port /dev/cu.usbmodem12301
+```
+
+Typical serial-port names are `COM4` on Windows, `/dev/cu.usbmodem*` on macOS,
+and `/dev/ttyACM*` or `/dev/ttyUSB*` on Linux.
 
 三页流程（操作员日常只用前两步）：
 - **① 首页**：连接设备 → 引导复位（回零）→ 选择实验轨迹 → 进入操作

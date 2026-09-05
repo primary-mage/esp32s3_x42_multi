@@ -325,12 +325,18 @@ class Machine:
             if line.startswith("ERR"):
                 raise LinkError(f"振动启动失败: {line}")
 
-    def vib_state(self) -> tuple[int, int, int]:
-        """(state, half_cycles, elapsed_ms)；state: 0空闲 1振动中 2完成 3失败 4已停止"""
-        for line in self.link.transact("VSTATE"):
-            p = line.split()
-            if len(p) == 4 and p[0] == "VSTATE":
-                return int(p[1]), int(p[2]), int(p[3])
+    def vib_state(self) -> tuple[int, int, int, str, int]:
+        """(state, half_cycles, elapsed_ms, fault_phase, fault_code)."""
+        # VSTATE is read-only, so retrying it cannot repeat a motor action.
+        for attempt in range(3):
+            for line in self.link.transact("VSTATE"):
+                p = line.split()
+                if len(p) >= 6 and p[0] == "VSTATE":
+                    return int(p[1]), int(p[2]), int(p[3]), p[4], int(p[5])
+                if len(p) == 4 and p[0] == "VSTATE":
+                    return int(p[1]), int(p[2]), int(p[3]), "UNKNOWN", -1
+            if attempt < 2:
+                time.sleep(0.1)
         raise LinkError("振动状态查询失败")
 
     def vib_stop(self) -> None:

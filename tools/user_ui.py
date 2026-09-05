@@ -19,6 +19,7 @@ X42 三轴平台 · 用户界面（化学实验演示仪器）
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import queue
@@ -31,6 +32,7 @@ from x42link import (DEFAULT_ACCEL, DEFAULT_LEAD_MM, DEFAULT_PULSES_REV,
                      DEFAULT_SPEED_MM_S, DEFAULT_TRAVEL_X, DEFAULT_TRAVEL_Y,
                      LinkError, Machine, X42Link)
 from curve_editor import CurveEditor, build_segments, interp_track
+from port_utils import default_controller_port
 
 TRAJ_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trajectories")
 
@@ -131,7 +133,7 @@ def list_trajectories() -> list[str]:
 # ================= 主窗口 =================
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, port: str | None = None):
         super().__init__()
         self.title("实验演示平台控制台")
         self.geometry("860x640")
@@ -144,8 +146,9 @@ class App(tk.Tk):
         self.stop_event = threading.Event()
         self.pause_event = threading.Event()
         self.exec_thread: threading.Thread | None = None
+        self._stir_center_y: float | None = None
 
-        self.port_var = tk.StringVar(value="/dev/ttyACM0")
+        self.port_var = tk.StringVar(value=port or default_controller_port())
         self.conn_var = tk.StringVar(value="● 未连接")
         self.pos_var = tk.StringVar(value="X=---  Y=---")
         self.home_state_var = tk.StringVar(value="等待连接")
@@ -236,6 +239,7 @@ class App(tk.Tk):
         row.pack(fill="x")
         ttk.Label(row, textvariable=self.conn_var, font=("", 11)).pack(side="left")
         ttk.Entry(row, textvariable=self.port_var, width=13).pack(side="right", padx=2)
+        ttk.Button(row, text="刷新", command=self._refresh_port).pack(side="right", padx=2)
         self.conn_btn = ttk.Button(row, text="连接", command=self.on_connect)
         self.conn_btn.pack(side="right", padx=4)
 
@@ -272,6 +276,11 @@ class App(tk.Tk):
         if names and not self.selected_traj_name.get():
             self.selected_traj_name.set(names[0])
             self._on_traj_selected()
+
+    def _refresh_port(self):
+        port = default_controller_port()
+        if port:
+            self.port_var.set(port)
 
     def _on_traj_selected(self):
         name = self.selected_traj_name.get()
@@ -743,6 +752,7 @@ class App(tk.Tk):
             stir_times = [t for s in stirs for t in (s["t0"], s["t1"])]
             segs = build_segments(self.traj.tracks, self.traj.duration_s,
                                   extra_times=tuple(stir_times))
+            error_message = None
             try:
                 for i, (t0, t1, x0, y0, x1, y1) in enumerate(segs):
                     if self.stop_event.is_set():
@@ -794,17 +804,24 @@ class App(tk.Tk):
                     self._ui("log", "轨迹已停止")
                 else:
                     self._ui("log", f"执行中断: {e}")
-                    self._ui("error", "执行", str(e))
+                    error_message = str(e)
             finally:
                 self._ui("busy", "空闲")
                 self._ui("run_btns", "normal", "disabled")
                 self._ui("clear_progress")
+                # Queue cleanup before the modal dialog so the UI is usable
+                # immediately after the operator acknowledges the error.
+                if error_message:
+                    self._ui("error", "执行", error_message)
 
     def _run_stir_slice(self, stir, t0, t1, x0, x1):
         """搅拌窗口内的一个时间片：起点启动振动；X 照常运动；终点等振动结束"""
         start = abs(t0 - stir["t0"]) < 1e-6
         end = abs(t1 - stir["t1"]) < 1e-6
         if start:
+            # Keep an independent physical reference. A lost FD acknowledgement
+            # is tolerated only when the mechanism demonstrably returns here.
+            _, self._stir_center_y = self.machine.position()
             dur_s = max(1, int(round(stir["t1"] - stir["t0"])))
             self._ui("highlight", stir["t0"], stir["t1"])
             self._ui("log", f"→ 搅拌 {stir['t0']:.1f}~{stir['t1']:.1f}s: "
@@ -820,8 +837,24 @@ class App(tk.Tk):
         if end:
             # 等固件振动自然结束（定时驱动，偶数半周期后回中心）
             st = 1
+            deadline = time.monotonic() + max(15.0, (t1 - t0) + 10.0)
+            query_error = None
             while not self.stop_event.is_set():
-                st, cyc, ms = self.machine.vib_state()
+                if time.monotonic() >= deadline:
+                    detail = f"（最后错误：{query_error}）" if query_error else ""
+                    self.machine.vib_stop()
+                    self._ui("log", "搅拌状态查询超时，已请求结束振动，继续执行轨迹" + detail)
+                    self._stir_center_y = None
+                    return
+                try:
+                    st, cyc, ms, phase, code = self.machine.vib_state()
+                    query_error = None
+                except LinkError as e:
+                    # The vibration task keeps running independently on the ESP32.
+                    # Do not interrupt a normal physical motion for one lost read.
+                    query_error = str(e)
+                    time.sleep(0.3)
+                    continue
                 if st in (2, 3, 4):
                     break
                 time.sleep(0.3)
@@ -829,8 +862,22 @@ class App(tk.Tk):
                 raise LinkError("已停止")
             af = (cyc / 2.0) / (ms / 1000.0) if ms > 0 else 0.0
             if st == 3:
-                raise LinkError("搅拌失败：堵转保护触发")
+                if phase.startswith("CLOG_"):
+                    raise LinkError(f"搅拌失败：{phase} 堵转保护触发（驱动器错误码 {code}）")
+                tolerated, detail = self._tolerate_vib_comm_fault(phase, code, cyc)
+                if not tolerated:
+                    raise LinkError(detail)
+                self._ui("log", "搅拌通信告警已恢复：" + detail)
             self._ui("log", f"  搅拌段完成（实际 {af:.1f}Hz）")
+            self._stir_center_y = None
+
+    def _tolerate_vib_comm_fault(self, phase, code, cycles):
+        """Treat post-motion VIB transport faults as non-blocking warnings."""
+        if phase.startswith("CLOG_"):
+            return False, f"搅拌失败：{phase} 堵转保护触发（驱动器错误码 {code}）"
+        if cycles > 0:
+            return True, f"阶段 {phase} 应答异常（错误码 {code}），已完成 {cycles} 个半周期"
+        return False, f"搅拌未确认启动：阶段 {phase}，错误码 {code}"
 
     def on_pause(self):
         self.pause_event.set()
@@ -905,4 +952,6 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    parser = argparse.ArgumentParser(description="X42 user interface")
+    parser.add_argument("--port", help="controller serial port, for example COM4 or /dev/ttyACM0")
+    App(parser.parse_args().port).mainloop()

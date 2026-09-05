@@ -12,6 +12,7 @@
  */
 #include "vib.h"
 #include "stall_guard.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -23,10 +24,18 @@
 #define VIB_ACC_GEAR      255   /* 最快加速度档位 */
 
 static zdt_x42_t *s_m1, *s_m2, *s_m3;
+static const char *TAG = "vib";
+
+/* EMM42_V5.0 may acknowledge an FD frame before its command parser is ready
+ * for the next frame. Keep the experimentally validated bus idle time used by
+ * the PC path explicit for the dual-motor vibration path. */
+#define VIB_FRAME_GAP_MS 15
 
 static volatile vib_state_t s_state = VIB_IDLE;
 static volatile uint32_t s_cycles = 0;
 static volatile uint32_t s_elapsed_ms = 0;
+static volatile vib_fault_phase_t s_fault_phase = VIB_FAULT_NONE;
+static volatile int s_fault_code = 0;
 static volatile bool s_stop_req = false;
 static volatile bool s_abort = false;
 static TaskHandle_t s_task = NULL;
@@ -59,15 +68,77 @@ void vib_stats(uint32_t *cycles, uint32_t *elapsed_ms)
     }
 }
 
-/** 下发一个半周期运动（押住+广播同步起步，不等应答） */
-static esp_err_t issue_half(bool cw, uint32_t pulses)
+void vib_fault_info(vib_fault_phase_t *phase, int *error_code)
+{
+    if (phase) *phase = s_fault_phase;
+    if (error_code) *error_code = s_fault_code;
+}
+
+const char *vib_fault_phase_name(vib_fault_phase_t phase)
+{
+    switch (phase) {
+    case VIB_FAULT_M1_FD: return "M1_FD";
+    case VIB_FAULT_M2_FD: return "M2_FD";
+    case VIB_FAULT_M3_FD: return "M3_FD";
+    case VIB_FAULT_GO: return "GO";
+    case VIB_FAULT_CLOG_M1: return "CLOG_M1";
+    case VIB_FAULT_CLOG_M2: return "CLOG_M2";
+    case VIB_FAULT_CLOG_M3: return "CLOG_M3";
+    case VIB_FAULT_CENTER_M1_FD: return "CENTER_M1_FD";
+    case VIB_FAULT_CENTER_M2_FD: return "CENTER_M2_FD";
+    case VIB_FAULT_CENTER_M3_FD: return "CENTER_M3_FD";
+    case VIB_FAULT_CENTER_GO: return "CENTER_GO";
+    case VIB_FAULT_CENTER_INPOS: return "CENTER_INPOS";
+    default: return "NONE";
+    }
+}
+
+static void set_fault(vib_fault_phase_t phase, esp_err_t code)
+{
+    s_fault_phase = phase;
+    s_fault_code = (int)code;
+}
+
+/** 下发一个半周期运动 */
+static esp_err_t issue_half(bool cw, uint32_t pulses, bool center)
 {
     if (s_id == 1) {
-        return zdt_x42_vib_step(s_m1, NULL, cw, false,
-                                VIB_MAX_RPM, VIB_ACC_GEAR, pulses);
+        /* 单机：无等待突发（已实测可靠） */
+        esp_err_t e = zdt_x42_vib_step(s_m1, NULL, cw, false,
+                                       VIB_MAX_RPM, VIB_ACC_GEAR, pulses);
+        if (e != ZDT_OK) {
+            set_fault(center ? VIB_FAULT_CENTER_M1_FD : VIB_FAULT_M1_FD, e);
+        }
+        return e;
     }
-    return zdt_x42_vib_step(s_m2, s_m3, cw, s_mirror,
-                            VIB_MAX_RPM, VIB_ACC_GEAR, pulses);
+    /* 双机龙门：走事务化路径（押住+等应答+广播），与上位机 POS+GO 完全一致。
+     * 突发连续写入会被 EMM5.0 电机解析器随机判错（回 00 EE），严禁用于双机。 */
+    int64_t t0 = esp_timer_get_time() / 1000;
+    esp_err_t e1 = zdt_x42_pos_mode(s_m2, cw, VIB_MAX_RPM, VIB_ACC_GEAR,
+                                    pulses, false, true);
+    ESP_LOGI(TAG, "dual half: m2 FD result=%d t=%lldms", (int)e1,
+             (long long)(esp_timer_get_time() / 1000 - t0));
+    if (e1 != ZDT_OK) {
+        set_fault(center ? VIB_FAULT_CENTER_M2_FD : VIB_FAULT_M2_FD, e1);
+        return e1;
+    }
+    vTaskDelay(pdMS_TO_TICKS(VIB_FRAME_GAP_MS));
+    esp_err_t e2 = zdt_x42_pos_mode(s_m3, s_mirror ? !cw : cw,
+                                    VIB_MAX_RPM, VIB_ACC_GEAR,
+                                    pulses, false, true);
+    vTaskDelay(pdMS_TO_TICKS(VIB_FRAME_GAP_MS));
+    ESP_LOGI(TAG, "dual half: m3 FD result=%d t=%lldms", (int)e2,
+             (long long)(esp_timer_get_time() / 1000 - t0));
+    if (e2 != ZDT_OK) {
+        set_fault(center ? VIB_FAULT_CENTER_M3_FD : VIB_FAULT_M3_FD, e2);
+        return e2;
+    }
+    vTaskDelay(pdMS_TO_TICKS(VIB_FRAME_GAP_MS));
+    esp_err_t e3 = zdt_x42_sync_start(s_m2);
+    ESP_LOGI(TAG, "dual half: GO result=%d total=%lldms", (int)e3,
+             (long long)(esp_timer_get_time() / 1000 - t0));
+    if (e3 != ZDT_OK) set_fault(center ? VIB_FAULT_CENTER_GO : VIB_FAULT_GO, e3);
+    return e3;
 }
 
 /** 周期内快速堵转保护检查：只读主电机；每 4 个半周期补查镜像电机 */
@@ -76,11 +147,13 @@ static bool check_clog(uint32_t cycle)
     zdt_x42_status_t st = {0};
     zdt_x42_t *m = (s_id == 1) ? s_m1 : s_m2;
     if (zdt_x42_read_status(m, &st) == ZDT_OK && st.clog) {
+        set_fault(s_id == 1 ? VIB_FAULT_CLOG_M1 : VIB_FAULT_CLOG_M2, ZDT_ERR_COND);
         return true;
     }
     if (s_id == 2 && (cycle & 3u) == 0) {
         zdt_x42_status_t st3 = {0};
         if (zdt_x42_read_status(s_m3, &st3) == ZDT_OK && st3.clog) {
+            set_fault(VIB_FAULT_CLOG_M3, ZDT_ERR_COND);
             return true;
         }
     }
@@ -92,7 +165,11 @@ static bool both_clog(void)
 {
     zdt_x42_status_t st = {0};
     if (s_id == 1) {
-        return zdt_x42_read_status(s_m1, &st) == ZDT_OK && st.clog;
+        if (zdt_x42_read_status(s_m1, &st) == ZDT_OK && st.clog) {
+            set_fault(VIB_FAULT_CLOG_M1, ZDT_ERR_COND);
+            return true;
+        }
+        return false;
     }
     zdt_x42_status_t st2 = {0}, st3 = {0};
     esp_err_t e2 = zdt_x42_read_status(s_m2, &st2);
@@ -100,6 +177,8 @@ static bool both_clog(void)
     if (e2 != ZDT_OK || e3 != ZDT_OK) {
         return false;
     }
+    if (st2.clog) set_fault(VIB_FAULT_CLOG_M2, ZDT_ERR_COND);
+    else if (st3.clog) set_fault(VIB_FAULT_CLOG_M3, ZDT_ERR_COND);
     return st2.clog || st3.clog;
 }
 
@@ -143,7 +222,6 @@ static void stop_motors(void)
 static void vib_task(void *arg)
 {
     (void)arg;
-    const int id = s_id;
     const uint32_t a_pul = s_a_pul;
     const uint32_t n_half = s_n_half;
     const uint32_t half_ms = s_half_ms;
@@ -164,7 +242,7 @@ static void vib_task(void *arg)
     while (!s_abort) {
         /* 半周期起点：+A, -2A, +2A, ... */
         uint32_t pul = (done == 0) ? a_pul : (2 * a_pul);
-        if (issue_half(cw, pul) != ZDT_OK) {
+        if (issue_half(cw, pul, false) != ZDT_OK) {
             failed = true;
             break;
         }
@@ -172,11 +250,6 @@ static void vib_task(void *arg)
         s_cycles = done;
         s_elapsed_ms = (uint32_t)((esp_timer_get_time() - t_start) / 1000);
         cw = !cw;
-
-        if (check_clog(done)) {
-            failed = true;
-            break;
-        }
 
         if (s_stop_req) {
             wait_inpos(3000);   /* 优雅停：等当前半周期到位 */
@@ -187,13 +260,31 @@ static void vib_task(void *arg)
         }
 
         vTaskDelayUntil(&wake, period);
+        /* 周期末尾再查堵转：GO 后立即读状态会干扰电机执行 */
+        if (check_clog(done)) {
+            failed = true;
+            break;
+        }
     }
 
     /* 回起振中心再停：偶数半周期后位于 -A 侧，回 +A；奇数侧回 -A */
     if (!failed && !s_abort) {
         bool back_cw = (done % 2 == 0);
-        if (issue_half(back_cw, a_pul) == ZDT_OK) {
-            wait_inpos(5000);
+        esp_err_t center_e = issue_half(back_cw, a_pul, true);
+        if (center_e != ZDT_OK) {
+            ESP_LOGE(TAG, "center half failed: %d", (int)center_e);
+            failed = true;
+        } else {
+            esp_err_t wait_e = wait_inpos(5000);
+            if (wait_e == ZDT_OK) {
+                /* centered successfully */
+            } else {
+                if (wait_e != ZDT_ERR_COND) {
+                    set_fault(VIB_FAULT_CENTER_INPOS, wait_e);
+                }
+                ESP_LOGE(TAG, "center half did not reach in-position");
+                failed = true;
+            }
         }
     }
 
@@ -255,6 +346,8 @@ esp_err_t vib_start(int id, int freq_dhz, int amp_tenth_mm, int dur_s, bool mirr
 
     s_cycles = 0;
     s_elapsed_ms = 0;
+    s_fault_phase = VIB_FAULT_NONE;
+    s_fault_code = 0;
     s_stop_req = false;
     s_abort = false;
     s_state = VIB_IDLE;

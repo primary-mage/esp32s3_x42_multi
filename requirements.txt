@@ -1,0 +1,2 @@
+# Python 3.10 or newer is required by the type annotations in tools/.
+pyserial>=3.5,<4

@@ -259,7 +259,9 @@ esp_err_t zdt_x42_sync_start(zdt_x42_t *m)
 esp_err_t zdt_x42_vib_step(zdt_x42_t *m2, zdt_x42_t *m3, bool cw, bool mirror,
                            uint16_t speed_rpm, uint8_t acc_gear, uint32_t pulses)
 {
-    if (!m2) {
+    /* 仅支持单机（m3==NULL）。双机龙门必须走 pos_mode+sync_start 事务路径：
+     * 突发连续写会被 EMM5.0 电机解析器随机判错（回 00 EE）。 */
+    if (!m2 || m3) {
         return ZDT_ERR_NULL;
     }
     uint8_t f2[] = {
@@ -268,30 +270,20 @@ esp_err_t zdt_x42_vib_step(zdt_x42_t *m2, zdt_x42_t *m3, bool cw, bool mirror,
         acc_gear,
         (uint8_t)(pulses >> 24), (uint8_t)(pulses >> 16),
         (uint8_t)(pulses >> 8), (uint8_t)pulses,
-        0x00, m3 ? 0x01 : 0x00,   /* REL +（双机时 SYNC 押住） */
+        0x00, 0x00,   /* REL + 立即执行 */
     };
-    uint8_t f3[] = {
-        m3->addr, 0xFD, (cw != mirror) ? 0x00 : 0x01,
-        (uint8_t)(speed_rpm >> 8), (uint8_t)speed_rpm,
-        acc_gear,
-        (uint8_t)(pulses >> 24), (uint8_t)(pulses >> 16),
-        (uint8_t)(pulses >> 8), (uint8_t)pulses,
-        0x00, 0x01,   /* REL + SYNC */
-    };
-    uint8_t go[] = { ZDT_BROADCAST_ADDR, 0xFF, 0x66 };
 
     if (xSemaphoreTake(s_bus_mutex[m2->uart_num],
                        pdMS_TO_TICKS(m2->timeout_ms)) != pdTRUE) {
         return ZDT_ERR_TIMEOUT;
     }
     uart_flush_input(m2->uart_num);
-    uart_write_bytes(m2->uart_num, f2, sizeof(f2));
-    uart_write_bytes(m2->uart_num, (const uint8_t[]){calc_checksum(m2->checksum, f2, sizeof(f2))}, 1);
-    if (m3) {
-        uart_write_bytes(m2->uart_num, f3, sizeof(f3));
-        uart_write_bytes(m2->uart_num, (const uint8_t[]){calc_checksum(m3->checksum, f3, sizeof(f3))}, 1);
-        uart_write_bytes(m2->uart_num, go, sizeof(go));
-        uart_write_bytes(m2->uart_num, (const uint8_t[]){calc_checksum(m2->checksum, go, sizeof(go))}, 1);
+    uint8_t buf2[sizeof(f2) + 1];
+    memcpy(buf2, f2, sizeof(f2));
+    buf2[sizeof(f2)] = calc_checksum(m2->checksum, f2, sizeof(f2));
+    if (uart_write_bytes(m2->uart_num, buf2, sizeof(buf2)) != (int)sizeof(buf2)) {
+        xSemaphoreGive(s_bus_mutex[m2->uart_num]);
+        return ZDT_ERR_TX;
     }
     xSemaphoreGive(s_bus_mutex[m2->uart_num]);
     return ZDT_OK;

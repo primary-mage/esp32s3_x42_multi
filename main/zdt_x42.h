@@ -117,12 +117,10 @@ esp_err_t zdt_x42_stop(zdt_x42_t *m, bool sync);
 esp_err_t zdt_x42_sync_start(zdt_x42_t *m);
 
 /**
- * @brief 振动步进（押住+广播同步起步，不等任何应答）
- *        在同一个总线互斥锁内，连续下发 m2/m3 的相对位置命令（sync=1）并广播 GO。
- *        运动期间电机应答缓慢，逐条等待会拖慢振动频率，故发射后立即返回；
+ * @brief 振动步进（单机无等待突发）：发相对位置命令后立即返回，不等应答。
+ *        仅用于单机（如 X 轴）；双机龙门必须走 pos_mode+sync_start 事务路径，
+ *        突发连续写会被 EMM5.0 电机解析器随机判错（回 00 EE）。
  *        堵转保护由调用方随后读状态位检测。
- * @param mirror 电机3 镜像：方向与 m2 相反
- * @note m3 传 NULL 时只发单机命令（sync=0 立即执行）
  */
 esp_err_t zdt_x42_vib_step(zdt_x42_t *m2, zdt_x42_t *m3, bool cw, bool mirror,
                            uint16_t speed_rpm, uint8_t acc_gear, uint32_t pulses);
