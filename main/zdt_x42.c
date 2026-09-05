@@ -256,6 +256,47 @@ esp_err_t zdt_x42_sync_start(zdt_x42_t *m)
     return zdt_x42_transact(m, tx, sizeof(tx), rx, sizeof(rx), &rl);
 }
 
+esp_err_t zdt_x42_vib_step(zdt_x42_t *m2, zdt_x42_t *m3, bool cw, bool mirror,
+                           uint16_t speed_rpm, uint8_t acc_gear, uint32_t pulses)
+{
+    if (!m2) {
+        return ZDT_ERR_NULL;
+    }
+    uint8_t f2[] = {
+        m2->addr, 0xFD, cw ? 0x00 : 0x01,
+        (uint8_t)(speed_rpm >> 8), (uint8_t)speed_rpm,
+        acc_gear,
+        (uint8_t)(pulses >> 24), (uint8_t)(pulses >> 16),
+        (uint8_t)(pulses >> 8), (uint8_t)pulses,
+        0x00, m3 ? 0x01 : 0x00,   /* REL +（双机时 SYNC 押住） */
+    };
+    uint8_t f3[] = {
+        m3->addr, 0xFD, (cw != mirror) ? 0x00 : 0x01,
+        (uint8_t)(speed_rpm >> 8), (uint8_t)speed_rpm,
+        acc_gear,
+        (uint8_t)(pulses >> 24), (uint8_t)(pulses >> 16),
+        (uint8_t)(pulses >> 8), (uint8_t)pulses,
+        0x00, 0x01,   /* REL + SYNC */
+    };
+    uint8_t go[] = { ZDT_BROADCAST_ADDR, 0xFF, 0x66 };
+
+    if (xSemaphoreTake(s_bus_mutex[m2->uart_num],
+                       pdMS_TO_TICKS(m2->timeout_ms)) != pdTRUE) {
+        return ZDT_ERR_TIMEOUT;
+    }
+    uart_flush_input(m2->uart_num);
+    uart_write_bytes(m2->uart_num, f2, sizeof(f2));
+    uart_write_bytes(m2->uart_num, (const uint8_t[]){calc_checksum(m2->checksum, f2, sizeof(f2))}, 1);
+    if (m3) {
+        uart_write_bytes(m2->uart_num, f3, sizeof(f3));
+        uart_write_bytes(m2->uart_num, (const uint8_t[]){calc_checksum(m3->checksum, f3, sizeof(f3))}, 1);
+        uart_write_bytes(m2->uart_num, go, sizeof(go));
+        uart_write_bytes(m2->uart_num, (const uint8_t[]){calc_checksum(m2->checksum, go, sizeof(go))}, 1);
+    }
+    xSemaphoreGive(s_bus_mutex[m2->uart_num]);
+    return ZDT_OK;
+}
+
 esp_err_t zdt_x42_home(zdt_x42_t *m, uint8_t home_mode, bool sync)
 {
     uint8_t tx[] = { m->addr, 0x9A, home_mode, sync ? 0x01 : 0x00 };

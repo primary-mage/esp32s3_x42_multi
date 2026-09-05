@@ -59,29 +59,36 @@ void vib_stats(uint32_t *cycles, uint32_t *elapsed_ms)
     }
 }
 
-/** 下发一个半周期运动（Y 轴双机押住+广播同步起步） */
+/** 下发一个半周期运动（押住+广播同步起步，不等应答） */
 static esp_err_t issue_half(bool cw, uint32_t pulses)
 {
     if (s_id == 1) {
-        return zdt_x42_pos_mode(s_m1, cw, VIB_MAX_RPM, VIB_ACC_GEAR,
-                                pulses, false, false);
+        return zdt_x42_vib_step(s_m1, NULL, cw, false,
+                                VIB_MAX_RPM, VIB_ACC_GEAR, pulses);
     }
-    esp_err_t e1 = zdt_x42_pos_mode(s_m2, cw, VIB_MAX_RPM, VIB_ACC_GEAR,
-                                    pulses, false, true);
-    esp_err_t e2 = zdt_x42_pos_mode(s_m3, s_mirror ? !cw : cw,
-                                    VIB_MAX_RPM, VIB_ACC_GEAR,
-                                    pulses, false, true);
-    if (e1 != ZDT_OK) {
-        return e1;
-    }
-    if (e2 != ZDT_OK) {
-        return e2;
-    }
-    return zdt_x42_sync_start(s_m2);
+    return zdt_x42_vib_step(s_m2, s_m3, cw, s_mirror,
+                            VIB_MAX_RPM, VIB_ACC_GEAR, pulses);
 }
 
-/** 堵转保护检查（只查 clog，瞬时 stall 位在快速反转时不可靠） */
-static bool any_clog(void)
+/** 周期内快速堵转保护检查：只读主电机；每 4 个半周期补查镜像电机 */
+static bool check_clog(uint32_t cycle)
+{
+    zdt_x42_status_t st = {0};
+    zdt_x42_t *m = (s_id == 1) ? s_m1 : s_m2;
+    if (zdt_x42_read_status(m, &st) == ZDT_OK && st.clog) {
+        return true;
+    }
+    if (s_id == 2 && (cycle & 3u) == 0) {
+        zdt_x42_status_t st3 = {0};
+        if (zdt_x42_read_status(s_m3, &st3) == ZDT_OK && st3.clog) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** 全部参与电机堵转检查（收尾/等位用） */
+static bool both_clog(void)
 {
     zdt_x42_status_t st = {0};
     if (s_id == 1) {
@@ -101,7 +108,7 @@ static esp_err_t wait_inpos(uint32_t timeout_ms)
 {
     int64_t deadline = (int64_t)esp_timer_get_time() / 1000 + timeout_ms;
     while ((int64_t)esp_timer_get_time() / 1000 < deadline) {
-        if (any_clog()) {
+        if (both_clog()) {
             return ZDT_ERR_COND;
         }
         zdt_x42_status_t st = {0};
@@ -146,7 +153,9 @@ static void vib_task(void *arg)
     int64_t t_start = esp_timer_get_time();
 
     TickType_t period = pdMS_TO_TICKS(half_ms);
-    TickType_t wake = xTaskGetTickCount() + period;
+    /* 注意：pxPreviousWakeTime 必须初始化为当前 tick，不能是 now+period，
+     * 否则每次调用都命中回绕检测分支、永不延时（实际频率会飙到极限） */
+    TickType_t wake = xTaskGetTickCount();
 
     bool cw = true;
     uint32_t done = 0;
@@ -164,7 +173,7 @@ static void vib_task(void *arg)
         s_elapsed_ms = (uint32_t)((esp_timer_get_time() - t_start) / 1000);
         cw = !cw;
 
-        if (any_clog()) {
+        if (check_clog(done)) {
             failed = true;
             break;
         }
