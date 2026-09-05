@@ -156,6 +156,12 @@ class App(tk.Tk):
             self.editor.set_selected_pos(pos)
             self._on_curve_changed()
             self.log(f"关键帧已更新为当前 {axis} 位置 {pos:.1f}mm")
+        elif kind == "vib_state":
+            st, af = args
+            text = self.VIB_TEXT.get(st, "?")
+            if af > 0:
+                text += f" {af:.1f}Hz"
+            self.vib_state_var.set(text)
         elif kind == "error":
             messagebox.showerror(args[0], args[1])
 
@@ -323,6 +329,25 @@ class App(tk.Tk):
         ttk.Button(jog, text="用当前实际位置更新选中关键帧",
                    command=self.on_update_selected).pack(side="right", padx=6)
 
+        vib = ttk.LabelFrame(frm, text="振荡搅拌（定时驱动，固件本地循环）")
+        vib.pack(fill="x", pady=(6, 2))
+        self.vib_axis_var = tk.StringVar(value="Y")
+        self.vib_f_var = tk.StringVar(value="2")
+        self.vib_a_var = tk.StringVar(value="5")
+        self.vib_dur_var = tk.StringVar(value="10")
+        self.vib_state_var = tk.StringVar(value="空闲")
+        ttk.Combobox(vib, textvariable=self.vib_axis_var, values=("X", "Y"),
+                     width=4, state="readonly").pack(side="left", padx=4, pady=6)
+        ttk.Label(vib, text="频率Hz").pack(side="left")
+        ttk.Entry(vib, textvariable=self.vib_f_var, width=5).pack(side="left", padx=2)
+        ttk.Label(vib, text="振幅±mm").pack(side="left", padx=(8, 2))
+        ttk.Entry(vib, textvariable=self.vib_a_var, width=5).pack(side="left", padx=2)
+        ttk.Label(vib, text="时长s(0=手动停)").pack(side="left", padx=(8, 2))
+        ttk.Entry(vib, textvariable=self.vib_dur_var, width=5).pack(side="left", padx=2)
+        ttk.Button(vib, text="开始", command=self.on_vib_start).pack(side="left", padx=6)
+        ttk.Button(vib, text="停止", command=self.on_vib_stop).pack(side="left", padx=4)
+        ttk.Label(vib, textvariable=self.vib_state_var, foreground="#666").pack(side="left", padx=8)
+
         save = ttk.Frame(frm)
         save.pack(fill="x", pady=4)
         ttk.Label(save, text="轨迹名").pack(side="left")
@@ -408,6 +433,72 @@ class App(tk.Tk):
             return
         self._ui("update_sel", axis,
                  x if axis == "X" else self._y_disp(y))
+
+    # ================= 振荡搅拌 =================
+    VIB_TEXT = {0: "空闲", 1: "振荡中", 2: "完成", 3: "失败(堵转)", 4: "已停止"}
+
+    def on_vib_start(self):
+        if not self._need_machine():
+            return
+        if not self.machine.homed:
+            messagebox.showwarning("未复位", "请先在首页执行复位")
+            return
+        try:
+            f = float(self.vib_f_var.get())
+            a = float(self.vib_a_var.get())
+            dur = int(float(self.vib_dur_var.get()))
+        except ValueError:
+            messagebox.showerror("参数错误", "频率/振幅/时长必须是数字")
+            return
+        if f <= 0 or a <= 0 or dur < 0:
+            messagebox.showerror("参数错误", "频率/振幅需大于 0")
+            return
+        axis = self.vib_axis_var.get()
+        threading.Thread(target=self._vib_worker,
+                         args=(axis, f, a, dur), daemon=True).start()
+
+    def on_vib_stop(self):
+        if not self._need_machine():
+            return
+        threading.Thread(target=self._vib_stop_worker, daemon=True).start()
+
+    def _vib_stop_worker(self):
+        with self.ops_lock:
+            try:
+                self.machine.vib_stop()
+                self._ui("log", "已请求停止振荡")
+            except LinkError as e:
+                self._ui("log", f"停止失败: {e}")
+
+    def _vib_worker(self, axis, f, a, dur):
+        with self.ops_lock:
+            self._ui("busy", "振荡中...")
+            try:
+                self.machine.check_vib_bounds(axis, a)
+                self.machine.vib_start(axis, f, a, dur,
+                                       mirror=(self.y3inv_var.get() and axis == "Y"))
+                self._ui("log", f"振荡开始: {axis}轴 ±{a}mm {f}Hz {dur}s")
+                t0 = time.time()
+                while True:
+                    time.sleep(0.5)
+                    st, cyc, ms = self.machine.vib_state()
+                    af = (cyc / 2.0) / (ms / 1000.0) if ms > 0 else 0.0
+                    self._ui("vib_state", st, af)
+                    if st in (2, 3, 4):
+                        break
+                    if dur and time.time() - t0 > dur + 30:
+                        raise LinkError("振荡超时未结束")
+                if st == 2:
+                    self._ui("log", f"振荡完成（实际 {af:.1f}Hz）")
+                elif st == 3:
+                    self._ui("log", "振荡失败：堵转保护触发")
+                elif st == 4:
+                    self._ui("log", f"振荡已停止（实际 {af:.1f}Hz）")
+            except LinkError as e:
+                self._ui("log", f"振荡失败: {e}")
+                self._ui("vib_state", 0, 0.0)
+            finally:
+                self._ui("busy", "空闲")
 
     def _build_advanced(self, parent):
         self.adv_visible = tk.BooleanVar(value=False)

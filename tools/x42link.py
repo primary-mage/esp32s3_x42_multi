@@ -312,3 +312,40 @@ class Machine:
                 progress()
             time.sleep(0.3)
         raise LinkError("回零超时")
+
+    # ---------- 振动（定时驱动搅拌） ----------
+    def vib_start(self, axis: str, freq_hz: float, amp_mm: float,
+                  duration_s: int, mirror: bool = False) -> None:
+        """下发频率/半幅/时长，ESP32 本地定时驱动振荡。
+        axis: 'X'（电机1）或 'Y'（电机2/3 龙门）；mirror=电机3 镜像。"""
+        vid = 1 if axis.upper() == "X" else 2
+        cmd = (f"VIB {vid} {int(round(freq_hz * 10))} {int(round(amp_mm * 10))} "
+               f"{int(duration_s)} {1 if mirror else 0}")
+        for line in self.link.transact(cmd):
+            if line.startswith("ERR"):
+                raise LinkError(f"振动启动失败: {line}")
+
+    def vib_state(self) -> tuple[int, int, int]:
+        """(state, half_cycles, elapsed_ms)；state: 0空闲 1振动中 2完成 3失败 4已停止"""
+        for line in self.link.transact("VSTATE"):
+            p = line.split()
+            if len(p) == 4 and p[0] == "VSTATE":
+                return int(p[1]), int(p[2]), int(p[3])
+        raise LinkError("振动状态查询失败")
+
+    def vib_stop(self) -> None:
+        """优雅停止：当前半周期到位后回中心停"""
+        self.link.transact("VIBSTP")
+
+    def check_vib_bounds(self, axis: str, amp_mm: float) -> None:
+        """起振中心（当前位置）± 半幅必须在软限位内"""
+        axis = axis.upper()
+        x, y = self.position()
+        if axis == "X":
+            if not (self.travel_x[0] + amp_mm <= x <= self.travel_x[1] - amp_mm):
+                raise LinkError(f"起振中心越界: X={x:.1f}mm，±{amp_mm}mm 超出行程 "
+                                f"{self.travel_x[0]}-{self.travel_x[1]}mm")
+        else:
+            if not (self.travel_y[0] + amp_mm <= y <= self.travel_y[1] - amp_mm):
+                raise LinkError(f"起振中心越界: Y={y:.1f}mm，±{amp_mm}mm 超出行程 "
+                                f"{self.travel_y[0]}-{self.travel_y[1]}mm")

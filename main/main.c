@@ -11,6 +11,7 @@
 #include "console_cmd.h"
 #include "pair_home.h"
 #include "stall_guard.h"
+#include "vib.h"
 #include "zdt_x42.h"
 
 static const char *TAG = "app";
@@ -66,6 +67,9 @@ void app_main(void)
 
     /* 电机1（X轴）回零状态机：碰撞找端 -> 退一圈 -> 设零点 */
     xhome_init(&g_motors[0]);
+
+    /* 振动（定时驱动搅拌）：id=1 X轴 / id=2 Y轴双机 */
+    vib_init(&g_motors[0], &g_motors[1], &g_motors[2]);
 
     ESP_LOGI(TAG, "命令模式就绪，等待上位机...");
 }

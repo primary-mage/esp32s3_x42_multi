@@ -26,6 +26,11 @@
  *     HSTAT <id>               读回零状态（bit2正在回零 bit3回零失败）
  *     REL <id>                解除堵转保护
  *     GUARD <0|1>             启用/禁用堵转自动恢复守护（用户 UI 应发 GUARD 0）
+ *     VIB <id> <freq_dHz> <amp_0.1mm> <dur_s> <mirror>
+ *                              振动（定时驱动）：id=1 X轴 / id=2 Y轴双机，半幅±amp，
+ *                              dur=0 持续到 VIBSTP；偶数半周期后回中心停
+ *     VIBSTP                  优雅停止振动（当前半周期到位后回中心）
+ *     VSTATE                  查振动状态
  *     STAT <id|0>             查状态（id=0 全部）
  *
  *   ESP -> PC:
@@ -37,6 +42,7 @@
 #include "console_cmd.h"
 #include "pair_home.h"
 #include "stall_guard.h"
+#include "vib.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -202,6 +208,7 @@ static void handle_line(char *line)
         int id = atoi(tok[1]);
         esp_err_t e = ZDT_OK;
         if (id == 0) {
+            vib_abort();   /* 急停联动：终止振动任务（电机随即被停） */
             for (int i = 1; i <= (int)s_count; i++) {
                 e = zdt_x42_stop(motor_by_id(i), false);
             }
@@ -283,6 +290,30 @@ static void handle_line(char *line)
         bool on = (atoi(tok[1]) != 0);
         stall_guard_set_enabled(on);
         cmd_ok("GUARD %d", on ? 1 : 0);
+    } else if (strcmp(tok[0], "VIB") == 0 && n >= 6) {
+        int id = atoi(tok[1]);
+        int f = atoi(tok[2]);
+        int a = atoi(tok[3]);
+        int dur = atoi(tok[4]);
+        bool mirror = (atoi(tok[5]) != 0);
+        esp_err_t e = vib_start(id, f, a, dur, mirror);
+        if (e == ESP_OK) {
+            cmd_ok("VIB %d f=%d.%dHz A=%d.%dmm dur=%ds",
+                   id, f / 10, f % 10, a / 10, a % 10, dur);
+        } else if (e == ESP_ERR_INVALID_ARG) {
+            cmd_err("VIB ARGS");
+        } else if (e == ESP_ERR_INVALID_STATE) {
+            cmd_err("VIB BUSY");
+        } else {
+            cmd_err("VIB %s", err_name(e));
+        }
+    } else if (strcmp(tok[0], "VIBSTP") == 0) {
+        vib_stop();
+        cmd_ok("VIBSTP");
+    } else if (strcmp(tok[0], "VSTATE") == 0) {
+        uint32_t c = 0, ms = 0;
+        vib_stats(&c, &ms);
+        printf("CMD> VSTATE %d %lu %lu\n", (int)vib_state(), (unsigned long)c, (unsigned long)ms);
     } else if (strcmp(tok[0], "STAT") == 0 && n >= 2) {
         cmd_stat(atoi(tok[1]));
     } else {
